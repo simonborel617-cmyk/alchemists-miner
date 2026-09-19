@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/pyi/
+dist/
+*.log
+miners.txt
+.env
+.env.*
+gpu-stop.txt
+.gpu-pid.json
+release/
