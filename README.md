@@ -1,7 +1,7 @@
 # Alchemists miner
 
 Standalone GPU miner for the [Alchemists](https://github.com/simonborel617-cmyk/alchemists) mine on Robinhood Chain: proof-of-work
-mining of alchemical ingredients. Most players mine straight from the game's website (CPU or WebGPU, no install). This repository is
+mining of alchemical ingredients. Most players mine straight from the game's website, https://alchemist-mine.com (CPU or WebGPU, no install). This repository is
 for rigs and rented cards: it is faster per card, runs unattended and drives up to 32 addresses per card.
 
 Two parts:
