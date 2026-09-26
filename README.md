@@ -49,7 +49,7 @@ python orchestrator/gpu-miner.py --help
 
 ## Run
 
-1. One private key per line in `miners.txt`. Each address needs ETH for gas and for the submit price (0.0002 ETH at the start, rising with mining).
+1. One private key per line in `miners.txt`. Each address needs ETH for gas and for the submit price (0.00002 ETH at the start, rising with mining).
 2. Put `deployments/<network>.json` next to the orchestrator: the contract addresses of the network you mine (`robinhood.json`, Robinhood Chain mainnet, is included in the release).
 3. A card over ssh, all addresses from `miners.txt`:
 
