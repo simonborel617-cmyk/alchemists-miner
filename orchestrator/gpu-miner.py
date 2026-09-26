@@ -12,8 +12,11 @@ per box and each submits from its own address.
 
 Per chain session m:
   * make sure challenge[m] exists (tick if not),
-  * send PARAMS challenge[m] ceil(minuteThreshold[m]) <addresses> to every box,
+  * send PARAMS challenge[m] floor(minuteThreshold[m]) <addresses> to every box,
   * on every FOUND: verify locally and keep that address's best of the minute,
+  * once an address holds a find that clears the exact threshold, re-send PARAMS for minute m to every box without
+    that address: the tier is rolled at reveal from a random seed, so a higher hash buys nothing and an address can
+    submit once per minute. When every address has a find, nothing is sent; the next minute carries the full list,
   * when session m+1 begins: every miner submits its best find of m in parallel (pays currentPrice),
     which also reveals older finds.
 
@@ -214,7 +217,9 @@ class Account_:
 # ------------------------------------------------------------------ miner processes
 class Box:
     """One hb-miner process per card, shared by every miner address: PARAMS carries the address list and the
-    miner hashes them round-robin, ratcheting each address's floor on its own. FOUND lines name the address."""
+    miner hashes them round-robin, ratcheting each address's floor on its own. FOUND lines name the address.
+    Within a minute the orchestrator re-sends PARAMS with a shorter list as addresses get a qualifying find; every
+    PARAMS makes hb-miner pick a fresh random nonce base and reset the floors, so no hash is repeated."""
     def __init__(self, cmd, default_addr, on_found, tag):
         self.cmd, self.default_addr, self.on_found, self.tag = cmd, default_addr, on_found, tag
         self.proc = None
@@ -282,30 +287,43 @@ class Miner:
     def __init__(self, idx, account, chain, dry):
         self.idx, self.account, self.chain, self.dry = idx, account, chain, dry
         self.tag = "m%d:%s" % (idx, account.address[:8])
-        self.cur = {"minute": None, "ch": None, "floor": None}
+        self.cur = {"minute": None, "ch": None, "floor": None, "tq8": None}
         self.best = {}  # minute -> (work, nonce)
+        self.done = None  # the minute in which this address already holds a find that clears the threshold
         self.lock = threading.Lock()
         self.stats = {"submits": 0, "skips": 0, "mined": [0] * 7, "keys": 0}
 
     def record(self, box, nonce, chx):
-        """A FOUND for this address arrived from a box: verify it and keep the best of the current minute."""
+        """A FOUND for this address arrived from a box: verify it and keep the best of the current minute.
+        Returns True for the address's first find of the minute whose work clears the exact threshold (tq8): the tier
+        is rolled at reveal, so a higher hash buys nothing and the caller stops hashing this address until the next
+        minute. The caller acts on it after this returns, never under self.lock."""
         with self.lock:
             m, ch = self.cur["minute"], self.cur["ch"]
             if not ch or chx.lower() != ch.lower():
-                return  # a find for a previous challenge that arrived after the session changed
+                return False  # a find for a previous challenge that arrived after the session changed
             w = work_q8(digest_of(self.account.address, nonce, chx))
             bits = w >> 8
             if bits < self.cur["floor"] - 4:
                 box.strikes += 1
                 log("[%s] garbage find bits=%d (floor %d) from %s" % (self.tag, bits, self.cur["floor"], box.tag))
-                return
+                return False
             prev = self.best.get(m)
             if prev is None or w > prev[0]:
                 self.best[m] = (w, nonce)
+            if w >= self.cur["tq8"] and self.done != m:
+                self.done = m
+                return True
+            return False
 
-    def set_session(self, m, ch, floor):
+    def qualified(self, m):
+        """True once this address holds a find of minute m that clears the threshold."""
         with self.lock:
-            self.cur = {"minute": m, "ch": ch, "floor": floor}
+            return self.done == m
+
+    def set_session(self, m, ch, floor, tq8):
+        with self.lock:
+            self.cur = {"minute": m, "ch": ch, "floor": floor, "tq8": tq8}
 
     def settle(self, m):
         """Submit the best find of session m (called during m+1), or reveal pending finds."""
@@ -370,21 +388,78 @@ class Orchestrator:
         self.boxes = [Box(c, miners[0].account.address, self.on_found, "box%d" % i) for i, c in enumerate(box_cmds)]
         if len(miners) > 32:
             log("WARNING: hb-miner takes at most 32 addresses per PARAMS; only the first 32 will be mined")
+        # Every PARAMS broadcast (new minute, narrowing, replay after a restart) runs under plock. Lock order is
+        # plock -> Miner.lock; a box reader thread holds neither when it wakes the narrower, so it never waits on them.
+        self.plock = threading.Lock()
+        self.session = None  # (minute, challenge, floor) the boxes are hashing
+        self.sent = None  # address list of the last broadcast
+        self.all_done = None  # minute already logged as fully found
+        self.wake = threading.Event()
+        threading.Thread(target=self.narrower, daemon=True).start()
 
     def on_found(self, box, addr, nonce, chx):
+        """Runs on a box's reader thread. record() has released the miner's lock when it returns; the re-send itself
+        happens on the narrower thread, so a slow box never stalls the reader of another."""
         mi = self.by_addr.get(addr.lower())
-        if mi is not None:
-            mi.record(box, nonce, chx)
+        if mi is not None and mi.record(box, nonce, chx):
+            self.wake.set()
 
     def addrs(self):
         return [mi.account.address for mi in self.miners[:32]]
+
+    def broadcast(self, ch, floor, addrs):
+        """Caller holds plock."""
+        self.sent = list(addrs)
+        for b in self.boxes:
+            b.params(ch, floor, addrs)
+
+    def start_session(self, m, ch, floor, tq8):
+        """New minute: every miner switches to it and every box gets the full address list."""
+        with self.plock:
+            for mi in self.miners:
+                mi.set_session(m, ch, floor, tq8)
+            self.session = (m, ch, floor)
+            self.broadcast(ch, floor, self.addrs())
+
+    def narrower(self):
+        while True:
+            self.wake.wait()
+            self.wake.clear()  # a find that lands during the pass below wakes another pass
+            try:
+                self.narrow()
+            except Exception as e:
+                log("narrow error: %s" % str(e)[:160])
+
+    def narrow(self):
+        """Re-send the current minute's PARAMS (same challenge and floor) with only the addresses that have no
+        qualifying find yet. With none left nothing is sent: an empty list would make hb-miner fall back to --addr,
+        so the cards stay on the last list until the next minute."""
+        msg = None
+        with self.plock:
+            if self.session is None:
+                return
+            m, ch, floor = self.session
+            left = [mi.account.address for mi in self.miners[:32] if not mi.qualified(m)]
+            if left == self.sent:
+                return  # the minute changed since the wake-up, or the address was not in the list
+            total = len(self.addrs())
+            if left:
+                self.broadcast(ch, floor, left)
+                msg = "minute %d: %d/%d addresses hold a qualifying find, cards now hash the other %d" % (
+                    m, total - len(left), total, len(left))
+            elif self.all_done != m:
+                self.all_done = m
+                msg = "minute %d: all %d addresses hold a qualifying find, PARAMS unchanged until the next minute" % (m, total)
+        if msg:
+            log(msg)
 
     def keep_alive(self):
         for b in self.boxes:
             if not b.alive and b.strikes < 3 and time.time() - b.started > 10:
                 b.start()
-                if b.last:
-                    b.params(*b.last)
+                with self.plock:  # replay the latest list, never one the narrower is about to replace
+                    if b.last:
+                        b.params(*b.last)
 
     def ensure_challenge(self, m):
         ch = self.chain.challenge(m)
@@ -430,13 +505,10 @@ class Orchestrator:
                 # integer floor of the threshold: a hash with floor(T) leading zeros can still carry enough
                 # fractional work to pass T, the exact check happens in record()/settle() against tq8
                 floor = tq8 // 256
-                for mi in self.miners:
-                    mi.set_session(m, ch, floor)
-                for b in self.boxes:
-                    b.params(ch, floor, self.addrs())
+                self.start_session(m, ch, floor, tq8)
                 cur_minute = m
                 try:
-                    log("minute %d: challenge %s.. floor %d bits (threshold %.2f), unlocked tier %d, ore %d, price %.7f ETH" % (
+                    log("minute %d: challenge %s.. floor %d bits (threshold %.2f), unlocked tier %d, materia %d, price %.7f ETH" % (
                         m, ch[:10], floor, tq8 / 256, self.chain.unlocked(), self.chain.ore(), self.chain.price() / 1e18))
                 except Exception:
                     log("minute %d: challenge %s.. floor %d bits" % (m, ch[:10], floor))
@@ -464,7 +536,7 @@ class Orchestrator:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--net", default=os.environ.get("NET", "robinhoodTestnet"))
+    ap.add_argument("--net", default=os.environ.get("NET", "robinhood"))
     ap.add_argument("--box", action="append", required=True, help="command that launches hb-miner (--addr/--persist are appended); repeat for several cards")
     ap.add_argument("--miners-file", help="file with one private key per line; each key gets its own process per --box")
     ap.add_argument("--dry", action="store_true", help="never send transactions")
